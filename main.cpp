@@ -16,6 +16,20 @@ void reset_bootloader() {
 	SCB.AIRCR = (0x5fa << 16) | (1 << 2); // SYSRESETREQ
 }
 
+auto keyb_report_desc = keyboard(
+	usage_page(UsagePage::Keyboard),
+	report_size(1),
+	report_count(13),
+	logical_minimum(0),
+	logical_maximum(255),
+	usage_minimum(0),
+	usage_maximum(255),
+	report_count(13),
+	report_size(8),
+	input(0x00)
+);
+
+
 auto report_desc = gamepad(
 	// Inputs.
 	buttons(11),
@@ -147,7 +161,7 @@ auto report_desc = gamepad(
 		report_count(1),
 		output(0x02)
 	),
-	
+
 	padding_out(5),
 	
 	usage_page(0xff55),
@@ -161,17 +175,22 @@ auto report_desc = gamepad(
 );
 
 auto dev_desc = device_desc(0x200, 0, 0, 0, 64, 0x1d50, 0x6080, 0x110, 1, 2, 3, 1);
-auto conf_desc = configuration_desc(1, 1, 0, 0xc0, 0,
+auto conf_desc = configuration_desc(2, 1, 0, 0xc0, 0,
 	// HID interface.
 	interface_desc(0, 0, 1, 0x03, 0x00, 0x00, 0,
 		hid_desc(0x111, 0, 1, 0x22, sizeof(report_desc)),
 		endpoint_desc(0x81, 0x03, 16, 1)
+	),
+	interface_desc(1, 0, 1, 0x03, 0x00, 0x00, 0,
+		hid_desc(0x111, 0, 1, 0x22, sizeof(keyb_report_desc)),
+		endpoint_desc(0x82, 0x03, 16, 1)
 	)
 );
 
 desc_t dev_desc_p = {sizeof(dev_desc), (void*)&dev_desc};
 desc_t conf_desc_p = {sizeof(conf_desc), (void*)&conf_desc};
 desc_t report_desc_p = {sizeof(report_desc), (void*)&report_desc};
+desc_t keyb_report_desc_p = {sizeof(keyb_report_desc), (void*)&keyb_report_desc};
 
 static Pin usb_dm = GPIOA[11];
 static Pin usb_dp = GPIOA[12];
@@ -222,7 +241,24 @@ class HID_arcin : public USB_HID {
 		}
 };
 
+class HID_keyb : public USB_HID {
+	public:
+		HID_keyb(USB_generic& usbd, desc_t rdesc) : USB_HID(usbd, rdesc, 1, 2, 64) {}
+
+	protected:
+		virtual bool set_output_report(uint32_t* buf, uint32_t len) {
+			// ignore
+			return true;
+		}
+
+		virtual bool set_feature_report(uint32_t* buf, uint32_t len) {
+			// ignore
+			return false;
+		}
+};
+
 HID_arcin usb_hid(usb, report_desc_p);
+HID_keyb usb_hid_keyb(usb, keyb_report_desc_p);
 
 uint32_t serial_num() {
 	uint32_t* uid = (uint32_t*)0x1ffff7ac;
@@ -291,6 +327,67 @@ class USB_strings : public USB_class_driver {
 		}
 };
 
+class analog_button {
+	public:
+		// config
+
+		// Number of ticks we need to advance before recognizing an input
+		uint32_t deadzone;
+		// How long to sustain the input before clearing it (if opposite direction is input, we'll release immediately)
+		uint32_t sustain_ms;
+		// Always provide a zero-input for one poll before reversing?
+		bool clear;
+
+		const volatile uint32_t &counter;
+
+		// State: Center of deadzone
+		uint32_t center;
+		// times to: reset to zero, reset center to counter
+		uint32_t t_timeout;
+
+		int8_t state; // -1, 0, 1
+		int8_t last_delta;
+	public:
+		analog_button(volatile uint32_t &counter, uint32_t deadzone, uint32_t sustain_ms, bool clear)
+			: deadzone(deadzone), sustain_ms(sustain_ms), clear(clear), counter(counter)
+		{
+			center = counter;
+			t_timeout = 0;
+			state = 0;
+		}
+
+		int8_t poll() {
+			uint8_t observed = counter;
+			int8_t delta = observed - center;
+			last_delta = delta;
+
+			uint8_t direction = 0;
+			if (delta >= (int32_t)deadzone) {
+				direction = 1;
+			} else if (delta <= -(int32_t)deadzone) {
+				direction = -1;
+			}
+
+			if (direction != 0) {
+				center = observed;
+				t_timeout = Time::time() + sustain_ms;
+			} else if (t_timeout != 0 && Time::time() >= t_timeout) {
+				state = 0;
+				center = observed;
+				t_timeout = 0;
+			}
+
+			if (direction == -state && clear) {
+				state = direction;
+				return 0;
+			} else if (direction != 0) {
+				state = direction;
+			}
+
+			return state;
+		}
+};
+
 USB_strings usb_strings(usb);
 
 struct report_t {
@@ -355,6 +452,9 @@ int main() {
 	qe2b.set_af(2);
 	qe2a.set_mode(Pin::AF);
 	qe2b.set_mode(Pin::AF);
+
+	analog_button tt1(TIM2.CNT, 4, 100, true);
+	analog_button tt2(TIM3.CNT, 4, 100, true);
 	
 	while(1) {
 		usb.process();
@@ -371,9 +471,63 @@ int main() {
 		}
 		
 		if(usb.ep_ready(1)) {
-			report_t report = {buttons, uint8_t(TIM2.CNT), uint8_t(TIM3.CNT)};
+			report_t report = {buttons, uint8_t(TIM2.CNT), uint8_t(TIM3.CNT) };
 			
 			usb.write(1, (uint32_t*)&report, sizeof(report));
+		}
+
+		if (usb.ep_ready(2)) {
+			unsigned char scancodes[13] = { 0 };
+
+			int nextscan = 0;
+#if 1
+			for (int i = 0; i < 9; i++) {
+				if (buttons & (1 << i)) {
+					scancodes[nextscan++] = 4 + i;
+				}
+			}
+#endif
+
+			if (buttons & (1 << 9)) { //start
+				scancodes[nextscan++] = 40; // ENTER
+			}
+
+			if (buttons & (1 << 10)) { //select
+				scancodes[nextscan++] = 42; // BACKSPACE
+			}
+
+			switch (tt1.poll()) {
+				case -1:
+					scancodes[nextscan++] = 4 + 21;
+					break;
+				case 1:
+					scancodes[nextscan++] = 4 + 22;
+					break;
+			}
+
+#if 1
+			switch (tt2.poll()) {
+				case -1:
+					scancodes[nextscan++] = 4 + 13;
+					break;
+				case 1:
+					scancodes[nextscan++] = 4 + 14;
+					break;
+			}
+#endif
+
+			while (nextscan < sizeof(scancodes)) {
+				scancodes[nextscan++] = 0;
+			}
+#if 0
+			scancodes[1] = tt1.last_delta;
+			scancodes[2] = tt1.state;
+
+			*(uint32_t *)(&scancodes[4]) = (TIM2.CNT);
+			*(uint32_t *)(&scancodes[8]) = (tt1.center);
+
+#endif
+			usb.write(2, (uint32_t*)scancodes, sizeof(scancodes));
 		}
 	}
 }
