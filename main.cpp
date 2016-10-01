@@ -32,8 +32,8 @@ auto keyb_report_desc = keyboard(
 
 auto report_desc = gamepad(
 	// Inputs.
-	buttons(11),
-	padding_in(5),
+	buttons(15),
+	padding_in(1),
 	
 	usage_page(UsagePage::Desktop),
 	usage(DesktopUsage::X),
@@ -396,6 +396,131 @@ struct report_t {
 	uint8_t axis_y;
 } __attribute__((packed));
 
+#define DEBOUNCE_TIME_MS 5
+
+uint16_t debounce_state = 0;
+uint16_t debounce_history[DEBOUNCE_TIME_MS] = { 0 };
+uint32_t debounce_sample_time = 0;
+int debounce_index = 0;
+
+/* 
+ * Perform debounce processing. The buttons input is sampled at most once per ms
+ * (when update is true); buttons is then set to the last stable state for each
+ * bit (i.e., the last state maintained for DEBOUNCE_TIME_MS consequetive samples
+ *
+ * We use update to sync to the USB polls; this helps avoid additional latency when
+ * debounce samples just after the USB poll.
+ */
+void debounce(uint16_t &buttons) {
+	if (Time::time() == debounce_sample_time) {
+		buttons = debounce_state;
+        return;
+	}
+
+    debounce_sample_time = Time::time();
+
+	debounce_history[debounce_index] = buttons;
+	debounce_index = (debounce_index + 1) % DEBOUNCE_TIME_MS;
+
+    uint16_t dbg = 0;
+
+	uint16_t has_ones = 0, has_zeroes = 0;
+	for (int i = 0; i < DEBOUNCE_TIME_MS; i++) {
+		has_ones |= debounce_history[i];
+		has_zeroes |= ~debounce_history[i];
+
+        dbg |= (debounce_history[i] & 1) ? (1 << i) : 0;
+	}
+
+	uint16_t stable = has_ones ^ has_zeroes;
+    dbg |= (stable & 1) ? (1 << 5) : 0;
+
+	debounce_state = (debounce_state & ~stable) | (has_ones & stable);
+    dbg |= (debounce_state & 1) ? (1 << 6) : 0;
+
+    dbg |= (buttons & 1) ? (1 << 10) : 0;
+
+	buttons = debounce_state;
+//    button_leds.set(dbg);
+}
+
+#define SETUP_IDLE 0
+#define SETUP_AWAIT_RELEASE 1
+#define SETUP_ACTIVE 2
+
+uint16_t setup_state = SETUP_IDLE;
+uint32_t setup_timer;
+int enable_keyboard = 0;
+int enable_debounce = 0;
+
+// returns true to suppress buttons
+int check_setup(uint16_t buttons) {
+	if (setup_state == SETUP_IDLE) {
+		if (!((buttons & (1 << 9)) && (buttons & (1 << 10)))) {
+			setup_timer = Time::time();
+			return 0;
+		}
+		
+		if (Time::time() - setup_timer > 5000) {
+			setup_state = SETUP_AWAIT_RELEASE;
+            return 1;
+		}
+
+		return 0;
+	}
+
+	// Update LEDs first
+	uint16_t led = 0;
+	if ((Time::time() / 1000) & 1) {
+		led |= (1 << 9);
+	} else {
+		led |= (1 << 10);
+	}
+
+	if (enable_keyboard) {
+		led |= (1 << 0);
+	}
+	if (enable_debounce) {
+		led |= (1 << 1);
+	}
+
+	button_leds.set(led);
+
+	if (setup_state == SETUP_AWAIT_RELEASE) {
+		// The user just pressed a button, so wait for them to release it
+		if (buttons) {
+			return 1;
+		} else {
+			setup_state = SETUP_ACTIVE;
+			setup_timer = Time::time();
+		}
+	}
+
+	// Check for attempts to leave setup mode
+	if (buttons & (1 << 9)) {
+		if (Time::time() - setup_timer > 1000) {
+			setup_state = SETUP_IDLE;
+			setup_timer = Time::time();
+			return 1;
+		}
+
+		return 1; // await timeout
+	}
+	setup_timer = Time::time();
+
+	if (buttons & (1 << 0)) {
+		// SW1 - Enable keyboard
+		enable_keyboard = !enable_keyboard;
+		setup_state = SETUP_AWAIT_RELEASE;
+	} else if (buttons & (1 << 1)) {
+		// SW2 - Enable debounce
+		enable_debounce = !enable_debounce;
+		setup_state = SETUP_AWAIT_RELEASE;
+	}
+
+	return 1;
+}
+
 int main() {
 	rcc_init();
 	
@@ -459,14 +584,50 @@ int main() {
 	while(1) {
 		usb.process();
 		
+		int setup_active = 0;
 		uint16_t buttons = button_inputs.get() ^ 0x7ff;
+		uint16_t debounced = buttons;
+
+		debounce(debounced);
+
+		if (check_setup(debounced)) {
+			debounced = buttons = 0;
+			setup_active = 1;
+		}
+
+		if (enable_debounce) {
+			buttons = debounced;
+		}
+
+		// The arcin has 11 digital inputs. We'll add an extra four for TT conversion.
+		// First, mask off the unused top five bits
+		buttons = buttons & ~(0xf800);
+
+		// And OR in our decoded quadrature directions
+		switch (tt1.poll()) {
+			case -1:
+				buttons |= (1 << 11);
+				break;
+			case 1:
+				buttons |= (1 << 12);
+				break;
+		}
+
+		switch (tt2.poll()) {
+			case -1:
+				buttons |= (1 << 13);
+				break;
+			case 1:
+				buttons |= (1 << 14);
+				break;
+		}
 		
 		if(do_reset_bootloader) {
 			Time::sleep(10);
 			reset_bootloader();
 		}
 		
-		if(Time::time() - last_led_time > 1000) {
+		if(!setup_active && (Time::time() - last_led_time > 1000)) {
 			button_leds.set(buttons);
 		}
 		
@@ -478,55 +639,48 @@ int main() {
 
 		if (usb.ep_ready(2)) {
 			unsigned char scancodes[13] = { 0 };
-
 			int nextscan = 0;
-#if 1
-			for (int i = 0; i < 9; i++) {
-				if (buttons & (1 << i)) {
-					scancodes[nextscan++] = 4 + i;
+
+			if (enable_keyboard) {
+
+				for (int i = 0; i < 9; i++) {
+					if (buttons & (1 << i)) {
+						scancodes[nextscan++] = 4 + i;
+					}
 				}
-			}
-#endif
 
-			if (buttons & (1 << 9)) { //start
-				scancodes[nextscan++] = 40; // ENTER
-			}
+				if (buttons & (1 << 9)) { //start
+					scancodes[nextscan++] = 40; // ENTER
+				}
 
-			if (buttons & (1 << 10)) { //select
-				scancodes[nextscan++] = 42; // BACKSPACE
-			}
+				if (buttons & (1 << 10)) { //select
+					scancodes[nextscan++] = 42; // BACKSPACE
+				}
 
-			switch (tt1.poll()) {
-				case -1:
-					scancodes[nextscan++] = 4 + 21;
-					break;
-				case 1:
-					scancodes[nextscan++] = 4 + 22;
-					break;
-			}
+				switch (tt1.poll()) {
+					case -1:
+						scancodes[nextscan++] = 4 + 21;
+						break;
+					case 1:
+						scancodes[nextscan++] = 4 + 22;
+						break;
+				}
 
-#if 1
-			switch (tt2.poll()) {
-				case -1:
-					scancodes[nextscan++] = 4 + 13;
-					break;
-				case 1:
-					scancodes[nextscan++] = 4 + 14;
-					break;
+				switch (tt2.poll()) {
+					case -1:
+						scancodes[nextscan++] = 4 + 13;
+						break;
+					case 1:
+						scancodes[nextscan++] = 4 + 14;
+						break;
+				}
+
 			}
-#endif
 
 			while (nextscan < sizeof(scancodes)) {
 				scancodes[nextscan++] = 0;
 			}
-#if 0
-			scancodes[1] = tt1.last_delta;
-			scancodes[2] = tt1.state;
 
-			*(uint32_t *)(&scancodes[4]) = (TIM2.CNT);
-			*(uint32_t *)(&scancodes[8]) = (tt1.center);
-
-#endif
 			usb.write(2, (uint32_t*)scancodes, sizeof(scancodes));
 		}
 	}
