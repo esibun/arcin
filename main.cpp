@@ -6,6 +6,12 @@
 #include <usb/usb.h>
 #include <usb/descriptor.h>
 #include <usb/hid.h>
+#include <math.h>
+
+#define TT1_INVERTED -1
+#define TT2_INVERTED 1
+#define TT1_SENS 0.25
+#define TT2_SENS 1
 
 static uint32_t& reset_reason = *(uint32_t*)0x10000000;
 
@@ -384,7 +390,7 @@ class analog_button {
 				state = direction;
 			}
 
-			return state;
+			return state * TT1_INVERTED;
 		}
 };
 
@@ -521,6 +527,40 @@ int check_setup(uint16_t buttons) {
 	return 1;
 }
 
+// emulated pos
+float tt1_pos = 0;
+float tt2_pos = 0;
+
+// actual, physical pos
+uint8_t tt1_last_pos = 0;
+uint8_t tt2_last_pos = 0;
+
+inline float get_delta(uint8_t newpos, uint8_t last, float sens) {
+	// get actual difference
+	float delta = (float)(newpos - last);
+
+	// normalize overflow
+	if ( delta < -127 ) 
+		delta += 256;
+	
+	// normalize underflow
+	if ( delta > 127 )
+		delta -= 256;
+	
+	// apply sensitivity
+	delta *= sens;
+
+	return delta;
+}
+
+inline float clip(float pos) {
+	while ( pos < 0 )
+		pos += 256;
+	while ( pos > 256 )
+		pos -= 256;
+	return pos;
+}
+
 int main() {
 	rcc_init();
 	
@@ -559,12 +599,16 @@ int main() {
 	RCC.enable(RCC.TIM3);
 	
 	TIM2.CCMR1 = (1 << 8) | (1 << 0);
+	#if TT1_INVERTED == 1
 	TIM2.CCER = 1 << 1;
+	#endif
 	TIM2.SMCR = 3;
 	TIM2.CR1 = 1;
 	
 	TIM3.CCMR1 = (1 << 8) | (1 << 0);
+	#if TT2_INVERTED == 1
 	TIM3.CCER = 1 << 1;
+	#endif
 	TIM3.SMCR = 3;
 	TIM3.CR1 = 1;
 	
@@ -580,7 +624,7 @@ int main() {
 
 	analog_button tt1(TIM2.CNT, 4, 100, true);
 	analog_button tt2(TIM3.CNT, 4, 100, true);
-	
+
 	while(1) {
 		usb.process();
 		
@@ -605,19 +649,19 @@ int main() {
 
 		// And OR in our decoded quadrature directions
 		switch (tt1.poll()) {
-			case -1:
+			case -1;
 				buttons |= (1 << 11);
 				break;
-			case 1:
+			case 1;
 				buttons |= (1 << 12);
 				break;
 		}
 
 		switch (tt2.poll()) {
-			case -1:
+			case -1;
 				buttons |= (1 << 13);
 				break;
-			case 1:
+			case 1;
 				buttons |= (1 << 14);
 				break;
 		}
@@ -632,7 +676,16 @@ int main() {
 		}
 		
 		if(usb.ep_ready(1)) {
-			report_t report = {buttons, uint8_t(TIM2.CNT), uint8_t(TIM3.CNT) };
+			tt1_pos += get_delta(TIM2.CNT, tt1_last_pos, TT1_SENS);
+			tt2_pos += get_delta(TIM3.CNT, tt2_last_pos, TT2_SENS);
+
+			tt1_pos = clip(tt1_pos);
+			tt2_pos = clip(tt2_pos);
+
+			tt1_last_pos = TIM2.CNT;
+			tt2_last_pos = TIM3.CNT;
+
+			report_t report = {buttons, (uint8_t)tt1_pos, (uint8_t)tt2_pos};
 			
 			usb.write(1, (uint32_t*)&report, sizeof(report));
 		}
