@@ -649,19 +649,19 @@ int main() {
 
 		// And OR in our decoded quadrature directions
 		switch (tt1.poll()) {
-			case -1;
+			case -1:
 				buttons |= (1 << 11);
 				break;
-			case 1;
+			case 1:
 				buttons |= (1 << 12);
 				break;
 		}
 
 		switch (tt2.poll()) {
-			case -1;
+			case -1:
 				buttons |= (1 << 13);
 				break;
-			case 1;
+			case 1:
 				buttons |= (1 << 14);
 				break;
 		}
@@ -692,7 +692,7 @@ int main() {
 
 		if (usb.ep_ready(2)) {
 			unsigned char scancodes[13] = { 0 };
-			int nextscan = 0;
+			unsigned int nextscan = 0;
 
 			if (enable_keyboard) {
 
